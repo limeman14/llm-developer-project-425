@@ -1,0 +1,21 @@
+- name: create-ticket
+  description: "Создаёт новый тикет и первую запись в истории"
+  input_json_schema: '{"type":"object","properties":{"user_id":{"type":"string"}, "category":{"type":"string"}, "text":{"type":"string"}},"required":["user_id", "text"]}'
+  action:
+    function_call:
+      function_id: d4eeb98kn6frd58q5tss
+      tag: $latest
+- name: list-my-ticket
+  description: "Возвращает тикеты пользователя по user_id"
+  input_json_schema: '{"type":"object","properties":{"user_id":{"type":"string"}},"required":["user_id"]}'
+  action:
+    function_call:
+      function_id: d4eeb98kn6frd58q5tss
+      tag: $latest
+- name: append-message
+  description: "Добавляет запись в историю диалога (ответ агента, уточнение пользователя)"
+  input_json_schema: '{"type":"object","properties":{"ticket_id":{"type":"string"}, "author":{"type":"string"}, "role":{"type":"string"}, "text":{"type":"string"}, "tokens":{"type":"number"}},"required":["ticket_id", "text"]}'
+  action:
+    function_call:
+      function_id: d4eeb98kn6frd58q5tss
+      tag: $latest
