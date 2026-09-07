@@ -1,0 +1,58 @@
+yawl: '0.2'
+defaultRetryPolicy:
+  errorList:
+    - ALL
+  errorListMode: INCLUDE
+start: step-functionCall140
+steps:
+  step-functionCall140:
+    functionCall:
+      functionId: d4emeagihs8407t7sg57
+      tag: $latest
+      output: |-
+        \({
+          has_new: ((.messages // []) | length > 0),
+          email_from: ((.messages // [])[0].from // null),
+          email_subject: ((.messages // [])[0].subject // ""),
+          email_text: ((.messages // [])[0].text // "")
+        })
+      next: step-switch883
+    description: Проверка почты на предмет новых писем
+  step-switch883:
+    switch:
+      choices:
+        - condition: .has_new == true
+          next: ask-agent
+      default:
+        next: step-no-op441
+  ask-agent:
+    aiStudioAgent:
+      promptTemplateId: fvtoe1pl45b0hb5br3r0
+      message: >-
+        \("Отправитель (user_id): " + .email_from + "\nТема: " + .email_subject
+        + "\nТекст:\n" + .email_text)
+      autoApprove: true
+      output: '{{ {"ask-agent": .} }}'
+      next: step-functionCall715
+    description: ''
+  step-functionCall715:
+    functionCall:
+      functionId: d4emhurtknvbrqrrfis4
+      tag: $latest
+      input: |-
+        \({
+          to: .email_from,
+          subject: .email_subject,
+          text: .["ask-agent"].Result
+        })
+      output: '{{ {"step-functionCall715": .} }}'
+      next: step-success684
+    description: Отправка ответа на обращение
+  step-success684:
+    success: {}
+  step-no-op441:
+    noOp:
+      output: '{{ {"step-no-op441": .} }}'
+      next: step-success607
+  step-success607:
+    success: {}

@@ -1,0 +1,130 @@
+yawl: "0.1"
+start: select_overdue_tickets
+
+steps:
+  # 1. databaseQuery — открытые тикеты старше 24 часов
+  select_overdue_tickets:
+    databaseQuery:
+      connection:
+        type: YDB
+        host: ydb.serverless.yandexcloud.net
+        port: 2135
+        database: /ru-central1/b1gfdl51ouvi2pv91lvc/etnep2qi5gnd10sqln6g
+        ssl: true
+        iam: true
+      query: |-
+        SELECT
+          id,
+          text,
+          created_at
+        FROM tickets
+        WHERE status = 'new'
+          AND created_at < CurrentUtcTimestamp() - Interval("PT24H")
+      mode: QUERY
+      timeout: 20s
+      retryPolicy:
+        errorList:
+          - DATABASE_QUERY_UNAVAILABLE
+          - DATABASE_QUERY_CONNECTION_FAILED
+          - YDB_CALL_SERVICE_UNAVAILABLE
+          - STEP_TIMEOUT
+        errorListMode: INCLUDE
+        initialDelay: 2s
+        backoffRate: 2.0
+        maxDelay: 30s
+        retryCount: 3
+      output: '\({"tickets": .ResultSets[0], "count": (.ResultSets[0] | length)})'
+      next: has_overdue
+
+  # 2. switch — нет catch-all "default", поэтому две ветки: пусто -> терминал, иначе -> дальше
+  has_overdue:
+    switch:
+      choices:
+        - condition: ".count == 0"
+          next: nothing_to_escalate
+        - condition: "true"
+          next: build_digest
+
+  # 3. aiStudioAgent — дайджест по выборке для оператора
+  build_digest:
+    aiStudioAgent:
+      promptTemplateId: "fvtoe1pl45b0hb5br3r0"
+      variables:
+        ticketsJson: '\(.tickets | tojson)'
+        ticketsCount: '\(.count | tostring)'
+      message: '\(.tickets | tojson)'
+      autoApprove: true
+      timeout: 60s
+      retryPolicy:
+        errorList:
+          - STEP_TIMEOUT
+          - STEP_INTERNAL
+        errorListMode: INCLUDE
+        initialDelay: 2s
+        backoffRate: 2.0
+        maxDelay: 30s
+        retryCount: 3
+      output: '\({"text": .Result})'
+      next: mark_escalated
+
+  # 4. databaseQuery — то же условие, что и в SELECT, чтобы не подхватить лишнее
+  mark_escalated:
+    databaseQuery:
+      connection:
+        type: YDB
+        host: ydb.serverless.yandexcloud.net
+        port: 2135
+        database: /ru-central1/b1gfdl51ouvi2pv91lvc/etnep2qi5gnd10sqln6g
+        ssl: true
+        iam: true
+      query: |-
+        UPDATE tickets
+        SET status = 'escalated'
+        WHERE status = 'new'
+          AND created_at < CurrentUtcTimestamp() - Interval("PT24H")
+      mode: EXEC
+      timeout: 20s
+      retryPolicy:
+        errorList:
+          - DATABASE_QUERY_UNAVAILABLE
+          - DATABASE_QUERY_CONNECTION_FAILED
+          - DATABASE_QUERY_DEADLOCK
+          - YDB_CALL_SERVICE_UNAVAILABLE
+          - STEP_TIMEOUT
+        errorListMode: INCLUDE
+        initialDelay: 2s
+        backoffRate: 2.0
+        maxDelay: 30s
+        retryCount: 3
+      output: '\({"rowsAffected": .})'
+      next: send_digest
+
+  # 5. httpCall — POST в CF email-sender; адрес оператора берёт функция сама из OPERATOR_EMAIL
+  send_digest:
+    httpCall:
+      url: "https://functions.yandexcloud.net/d4emhurtknvbrqrrfis4"
+      method: POST
+      headers:
+        Content-Type: "application/json"
+      body: '\({"subject": "Дайджест по просроченным тикетам: \(.count) шт.", "body": .text})'
+      timeout: 15s
+      retryPolicy:
+        errorList:
+          - HTTP_CALL_500
+          - HTTP_CALL_502
+          - HTTP_CALL_503
+          - HTTP_CALL_504
+          - STEP_TIMEOUT
+        errorListMode: INCLUDE
+        initialDelay: 2s
+        backoffRate: 2.0
+        maxDelay: 30s
+        retryCount: 5
+      output: '\({})'
+      next: done
+
+  nothing_to_escalate:
+    success: {}
+
+  done:
+    success: {}
