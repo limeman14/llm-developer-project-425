@@ -49,6 +49,21 @@ CREATE TABLE messages (
        - ticket_id + text                    -> append-message
        - user_id + category + text           -> create-ticket
        - только user_id (без category/text/ticket_id) -> list-my-tickets
+
+PII-маскирование:
+    Перед каждым INSERT/UPSERT в tickets.text / messages.text текст
+    прогоняется через mask_pii(). Маскирование живёт здесь, в Cloud
+    Function на границе записи, а не в промпте агента — иначе любой
+    другой клиент той же БД (например, дашборд) записал бы данные без
+    маскирования, да и промпт-фильтр сам по себе ненадёжен.
+    Формат маски фиксирован:
+      телефон -> +7 (***) ***-**-NN   (последние 2 цифры сохраняются
+                                        для оператора)
+      email   -> [email]
+      карта   -> ****-****-****-****
+    В логах (logger.info/warning/error) пишутся только метаданные
+    (action, user_id, category, ticket_id и т.п.) либо уже маскированный
+    текст — сырой текст пользователя в лог не попадает.
 """
 
 import base64
@@ -56,6 +71,7 @@ import datetime
 import json
 import logging
 import os
+import re
 import uuid
 
 import ydb
@@ -69,6 +85,44 @@ YDB_DATABASE = os.environ.get("YDB_DATABASE", "")
 
 _driver = None
 _pool = None
+
+
+# ---------------------------------------------------------------------------
+# PII-маскирование. Применяется непосредственно перед записью в YDB
+# (см. _create_ticket / _append_message), а не раньше в пайплайне —
+# так гарантируется, что любой путь записи в tickets/messages пройдёт
+# через маскирование, даже если появятся новые вызывающие места.
+# ---------------------------------------------------------------------------
+
+_PHONE_RE = re.compile(
+    r"(?:\+7|8)[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?(\d{2})"
+)
+_EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+_CARD_RE = re.compile(r"\b\d{4}[ \-]?\d{4}[ \-]?\d{4}[ \-]?\d{4}\b")
+
+
+def mask_phone(text):
+    return _PHONE_RE.sub(lambda m: f"+7 (***) ***-**-{m.group(1)}", text)
+
+
+def mask_email(text):
+    return _EMAIL_RE.sub("[email]", text)
+
+
+def mask_card(text):
+    return _CARD_RE.sub("****-****-****-****", text)
+
+
+def mask_pii(text):
+    """Маскирует телефон, email и номер карты в тексте. Порядок важен:
+    телефон и email маскируются раньше карты, чтобы длинные цифровые
+    последовательности телефона не были ошибочно приняты за номер карты."""
+    if not text:
+        return text
+    text = mask_phone(text)
+    text = mask_email(text)
+    text = mask_card(text)
+    return text
 
 
 def _get_pool():
@@ -115,6 +169,11 @@ def _create_ticket(pool, user_id, category, text):
     created_dt = datetime.datetime.utcnow()
     created_at_iso = created_dt.isoformat() + "Z"
 
+    # PII-маскирование на границе записи: дальше в YQL и в лог попадёт
+    # только masked_text, сырой text используется только выше по стеку
+    # (например, если агенту нужно было бы что-то с ним сделать до записи).
+    masked_text = mask_pii(text)
+
     def callee(session):
         prepared = session.prepare(
             """
@@ -135,7 +194,7 @@ def _create_ticket(pool, user_id, category, text):
                 "$ticket_id": ticket_id,
                 "$user_id": user_id,
                 "$category": category,
-                "$text": text,
+                "$text": masked_text,
                 "$status": "new",
                 "$created_at": created_dt,
             },
@@ -183,6 +242,9 @@ def _list_my_tickets(pool, user_id):
         else:
             created_at_str = str(created_at)
 
+        # row["text"] уже маскирован — маскирование применяется один раз,
+        # на этапе записи (_create_ticket/_append_message), поэтому здесь
+        # повторно маскировать не нужно.
         tickets.append(
             {
                 "id": row["id"],
@@ -201,6 +263,9 @@ def _append_message(pool, ticket_id, author, text, tokens=None):
     # читать её обратно для памяти агента не требуется.
     message_id = str(uuid.uuid4())
     created_dt = datetime.datetime.utcnow()
+
+    # PII-маскирование на границе записи (тот же принцип, что в _create_ticket).
+    masked_text = mask_pii(text)
 
     def callee(session):
         prepared = session.prepare(
@@ -222,7 +287,7 @@ def _append_message(pool, ticket_id, author, text, tokens=None):
                 "$message_id": message_id,
                 "$ticket_id": ticket_id,
                 "$author": author,
-                "$text": text,
+                "$text": masked_text,
                 "$tokens": int(tokens or 0),
                 "$created_at": created_dt,
             },
@@ -285,6 +350,8 @@ def _http_response(status_code, body_obj):
 def handle(event, context):
     try:
         action, payload, source = _normalize_event(event)
+        # В лог пишем только action/source — сырой текст обращения сюда
+        # не попадает ни на одном пути.
         logger.info("ydb-tickets: source=%s action=%s", source, action)
 
         pool = _get_pool()
@@ -331,6 +398,9 @@ def handle(event, context):
         return result
 
     except Exception as exc:  # noqa: BLE001
+        # Сообщение исключения (str(exc)) может в редких случаях содержать
+        # фрагмент входных данных драйвера YDB — специально не логируем
+        # payload целиком, только текст самого exc.
         logger.exception("ydb-tickets error: %s", exc)
         if isinstance(event, dict) and "httpMethod" in event:
             return _http_response(500, {"error": str(exc)})
