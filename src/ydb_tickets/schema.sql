@@ -11,8 +11,9 @@ CREATE TABLE tickets (
 );
 
 CREATE TABLE messages (
-                          id           Utf8,        -- UUID
-                          ticket_id    Utf8,        -- ссылка на tickets.id
+                          user_id      Utf8,        -- email отправителя (ключ диалога)
+                          id           Utf8,        -- UUID сообщения
+                          ticket_id    Utf8,        -- ссылка на tickets.id (NULL, пока тикет не создан)
                           role         Utf8,        -- user | agent
                           text         Utf8,        -- текст сообщения (после PII-маскирования)
                           model        Utf8,        -- какая модель отвечала (если role=agent)
@@ -20,5 +21,5 @@ CREATE TABLE messages (
                           tokens_out   Uint64,
                           latency_ms   Uint32,
                           created_at   Timestamp,
-                          PRIMARY KEY (ticket_id, id)
+                          PRIMARY KEY (user_id, id)
 );
