@@ -143,12 +143,17 @@ def _get_conversation_history(
 _PHONE_RE = re.compile(
     r"(?:\+7|8)[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?(\d{2})"
 )
+# Телефон без префикса: 10 цифр, начинающихся с 8/9 (напр. 9123456789).
+_PHONE_BARE_RE = re.compile(r"(?<!\d)[89]\d{9}(?!\d)")
 _EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 _CARD_RE = re.compile(r"\b\d{4}[ \-]?\d{4}[ \-]?\d{4}[ \-]?\d{4}\b")
 
 
 def mask_phone(text):
-    return _PHONE_RE.sub(lambda m: f"+7 (***) ***-**-{m.group(1)}", text)
+    text = _PHONE_RE.sub(lambda m: f"+7 (***) ***-**-{m.group(1)}", text)
+    return _PHONE_BARE_RE.sub(
+        lambda m: f"+7 (***) ***-**-{m.group(0)[-2:]}", text
+    )
 
 
 def mask_email(text):
@@ -182,7 +187,6 @@ _INJECTION_RE = re.compile(
     r"|проигнорируй.*(предыдущ|все).*инструкц"
     r"|drop table|delete from"
     r"|удали.*(вс[её].*)?тикет"
-    r"|append-message"
 )
 
 
@@ -313,6 +317,31 @@ def _extract_ticket_id(data: dict) -> str | None:
     return None
 
 
+def _log_output_tools(data: dict) -> None:
+    """Логирует вызовы инструментов (file_search / mcp) из output[].
+
+    Нужно, чтобы отличать «в базе знаний ничего не нашлось» от «индекс
+    пустой/чужой»: по results=0 vs results>0 и по именам файлов-источников
+    это видно в логах, а не только по формулировке ответа агента."""
+    for item in data.get("output", []) or []:
+        item_type = item.get("type")
+        if item_type == "file_search_call":
+            results = item.get("results") or []
+            logger.info(
+                "FILE_SEARCH status=%s results=%d",
+                item.get("status"),
+                len(results),
+            )
+            for result in results:
+                logger.info(
+                    "FILE_SEARCH_RESULT file=%s score=%s",
+                    result.get("filename") or result.get("file_id"),
+                    result.get("score"),
+                )
+        elif item_type == "mcp_call":
+            logger.info("MCP_CALL name=%s", item.get("name"))
+
+
 def _call_responses_api(
         history: list[dict],
         user_text: str,
@@ -384,8 +413,10 @@ def _call_responses_api(
 
     answer_text = _extract_output_text(data)
     ticket_id = _extract_ticket_id(data)
+    _log_output_tools(data)
 
     usage = data.get("usage", {})
+    logger.info("USAGE %s", usage)
     tokens_in = usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0)
     tokens_out = usage.get("completion_tokens", 0) or usage.get("output_tokens", 0)
 

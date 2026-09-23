@@ -17,16 +17,33 @@ Yandex Cloud Function: ydb-tickets
 аутентификация внутри CF идёт через MetadataUrlCredentials (метаданные СА,
 привязанного к функции) — отдельный IAM-токен передавать не нужно.
 
-DDL таблиц (создать заранее, например через YDB CLI/консоль):
+DDL таблиц (создать заранее, например через YDB CLI/консоль) — актуальная
+версия лежит в schema.sql рядом с этим файлом:
 
 CREATE TABLE tickets (
-    id Utf8,
+    id Utf8,                                  -- UUID
+    user_id Utf8,                             -- email отправителя
+    category Utf8,                            -- bug | docs | feature | access
+    status Utf8,                              -- new | open | answered | escalated | closed
+    text Utf8,                                -- текст обращения (после PII-маскирования)
+    created_at Timestamp,
+    updated_at Timestamp,
+    PRIMARY KEY (id),
+    INDEX tickets_by_user GLOBAL ON (user_id)
+);
+
+CREATE TABLE messages (
     user_id Utf8,
-    category Utf8,
+    id Utf8,
+    ticket_id Utf8,
+    role Utf8,
     text Utf8,
-    status Utf8,
-    created_at Utf8,
-    PRIMARY KEY (id)
+    model Utf8,
+    tokens_in Uint64,
+    tokens_out Uint64,
+    latency_ms Uint32,
+    created_at Timestamp,
+    PRIMARY KEY (user_id, id)
 );
 
 Контракт функции — три источника события:
@@ -64,6 +81,8 @@ Guardrail (prompt injection):
     2) классификатор safe | injection | off-topic на yandexgpt-lite
        (_classify_intent). При ошибке/таймауте классификатора — fail-open
        (считаем обращение safe), чтобы сбой модерации не ронял приём.
+       Если же не задан YC_FOLDER_ID, функция падает явно: это ошибка
+       деплоя, а не сбой модели, и fail-open её маскировать не должен.
     injection -> тикет НЕ создаётся, в лог пишется ALERT_INJECTION_BLOCKED,
     клиенту возвращается {"error": "blocked", "reason": "injection_detected"}.
     off-topic -> тикет создаётся, факт логируется.
@@ -102,12 +121,17 @@ _pool = None
 _PHONE_RE = re.compile(
     r"(?:\+7|8)[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?(\d{2})"
 )
+# Телефон без префикса: 10 цифр, начинающихся с 8/9 (напр. 9123456789).
+_PHONE_BARE_RE = re.compile(r"(?<!\d)[89]\d{9}(?!\d)")
 _EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 _CARD_RE = re.compile(r"\b\d{4}[ \-]?\d{4}[ \-]?\d{4}[ \-]?\d{4}\b")
 
 
 def mask_phone(text):
-    return _PHONE_RE.sub(lambda m: f"+7 (***) ***-**-{m.group(1)}", text)
+    text = _PHONE_RE.sub(lambda m: f"+7 (***) ***-**-{m.group(1)}", text)
+    return _PHONE_BARE_RE.sub(
+        lambda m: f"+7 (***) ***-**-{m.group(0)[-2:]}", text
+    )
 
 
 def mask_email(text):
@@ -141,7 +165,6 @@ _INJECTION_RE = re.compile(
     r"|проигнорируй.*(предыдущ|все).*инструкц"
     r"|drop table|delete from"
     r"|удали.*(вс[её].*)?тикет"
-    r"|append-message"
 )
 
 _iam_token_cache = {"token": None, "expires_at": 0.0}
@@ -189,11 +212,17 @@ def _classify_intent(text):
     При любой ошибке/таймауте возвращает safe (fail-open), чтобы сбой
     модерации не блокировал приём легитимных обращений."""
     folder_id = os.environ.get("YC_FOLDER_ID", "")
+    if not folder_id:
+        # Отсутствие конфигурации классификатора — не сбой модерации, а
+        # ошибка деплоя: без неё от инъекций остаётся один regex. Поэтому
+        # падаем явно, а fail-open оставляем только для ошибок/таймаута
+        # самой модели ниже.
+        raise RuntimeError(
+            "YC_FOLDER_ID is required for the intent classifier"
+        )
     model_uri = os.environ.get("CLASSIFIER_MODEL") or (
         f"gpt://{folder_id}/yandexgpt-lite/latest"
     )
-    if not folder_id:
-        return "safe"
 
     messages = [{"role": "system", "text": _CLASSIFIER_INSTRUCTIONS}]
     for sample, label in _CLASSIFIER_FEWSHOT:
@@ -322,23 +351,28 @@ def _create_ticket(pool, user_id, category, text):
     return {"ticket_id": ticket_id, "created_at": created_at_iso}
 
 
-def _list_my_tickets(pool, user_id):
+def _list_my_tickets(pool, user_id, limit=50):
     holder = {"rows": []}
 
     def callee(session):
+        # В YQL вторичный индекс читается явно через VIEW. LIMIT
+        # ограничивает выборку, чтобы в контекст агента не уезжала вся
+        # история пользователя.
         prepared = session.prepare(
             """
             DECLARE $user_id AS Utf8;
+            DECLARE $limit AS Uint64;
 
             SELECT id, status, category, text, created_at
-            FROM tickets
+            FROM tickets VIEW tickets_by_user
             WHERE user_id = $user_id
-            ORDER BY created_at DESC;
+            ORDER BY created_at DESC
+            LIMIT $limit;
             """
         )
         result_sets = session.transaction(ydb.OnlineReadOnly()).execute(
             prepared,
-            {"$user_id": user_id},
+            {"$user_id": user_id, "$limit": limit},
             commit_tx=True,
         )
         holder["rows"] = result_sets[0].rows

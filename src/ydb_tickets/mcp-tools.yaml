@@ -1,5 +1,5 @@
 - name: create-ticket
-  description: "Создаёт новый тикет и первую запись в истории"
+  description: "Создаёт новый тикет. Историю диалога ведёт email-poller"
   input_json_schema: '{"type":"object","properties":{"user_id":{"type":"string"}, "category":{"type":"string"}, "text":{"type":"string"}},"required":["user_id", "text"]}'
   action:
     function_call:

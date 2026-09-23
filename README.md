@@ -10,9 +10,9 @@
 * при обращении вне базы — создаётся тикет (create-ticket)
 * история сообщений пишется в message
 * PII-маскирование перед записью (телефон → +7 (***) ***-**-NN, email → [email], карта → ****-****-****-****)
-* guardrail от prompt injection (regex + yandexgpt-lite, fail-open) в ydb-tickets, дополнительный regex в email-poller 
+* guardrail от prompt injection (regex + yandexgpt-lite, fail-open при сбое модели) в ydb-tickets, дополнительный regex в email-poller
 * учёт токенов: usage из Responses API → messages.tokens_in/out
-* авто-эскалация: workflow daily-escalation (сейчас — каждый час в 9:00 MSK) → дайджест оператору по почте
+* авто-эскалация: workflow daily-escalation (ежедневно в 9:00 MSK) → дайджест оператору по почте
 #### Что не работает
 * так как intent detector находится в ydb-tickets, при off-topic запросе ("Расскажи анекдот") ответ все равно отправляется на почту
 
@@ -32,8 +32,10 @@
 
 Дополнительные переменные окружения (не секреты): `MCP_SERVER_URL` — полный
 SSE-URL MCP-шлюза (`https://<mcpgw-id>.<salt>.mcpgw.serverless.yandexcloud.net/sse`),
-`SEARCH_INDEX_ID` — индекс базы знаний для `file_search`, `YC_FOLDER_ID` и
-`CLASSIFIER_MODEL` (опционально; по умолчанию
+`SEARCH_INDEX_ID` — индекс базы знаний для `file_search`, `YC_FOLDER_ID` —
+id каталога (нужен и поллеру, и классификатору в CF `ydb-tickets`),
+`AI_MODEL` (опционально; по умолчанию `gpt://<YC_FOLDER_ID>/yandexgpt/latest`)
+и `CLASSIFIER_MODEL` (опционально; по умолчанию
 `gpt://<YC_FOLDER_ID>/yandexgpt-lite/latest`) — для классификатора в CF `ydb-tickets`.
 
 ### Список ролей у сервисного аккаунта (ai-studio-sa)
@@ -54,8 +56,6 @@ src/
 │   │                        #         (MCP + file_search) → YDB (messages) → SMTP
 │   ├── email_sender.py      # SMTP-обёртка для workflow (YaWL не умеет сырой SMTP)
 │   └── requirements.txt     # ydb (упаковка zip)
-├── help-desk-workflow.yaml  # YaWL: отдельный/legacy путь приёма писем
-│                            #       (regex + классификатор + aiStudioAgent)
 ├── workflow.yaml            # YaWL: авто-эскалация по расписанию
 ├── knowledge-base/          # RAG-документы для file_search
 └── ydb_tickets/
@@ -67,9 +67,8 @@ README.md                    # запуск за ~15 минут + раздел �
 ```
 
 Примечание: активный приём почты — `email_functions/email_poller.py` (он сам
-вызывает агента и MCP). `help-desk-workflow.yaml` — отдельный путь, его контракт
-`check-mailbox` (возврат `{"messages": [...]}`) с текущим poller'ом не совпадает;
-оставлен как есть.
+вызывает агента и MCP). `workflow.yaml` — отдельный путь по расписанию для
+авто-эскалации просроченных тикетов.
 
 ## Защита агента: фильтры + ИИ-модерация
 
@@ -110,11 +109,11 @@ Help Desk агента (MCP + YDB) от prompt injection и утечек PII.
    «в агенте»[web:50].
 3. **Классификатор `safe | injection | off-topic`** — реализован на
    `yandexgpt-lite` (few-shot), что дешевле полной модели генерации в ~10 раз:
-   в CF `ydb-tickets` — `src/ydb_tickets/index.py::_classify_intent`, в YaWL —
-   шаг `fewShotClassify` (`src/help-desk-workflow.yaml`).
+   в CF `ydb-tickets` — `src/ydb_tickets/index.py::_classify_intent`.
    При ошибке или таймауте классификатора применяется **fail-open**: запрос
    пропускается как `safe`, чтобы сбой модерации не блокировал приём легитимных
-   обращений.
+   обращений. Если же не задан `YC_FOLDER_ID`, функция падает явно — это ошибка
+   деплоя, а не сбой модели, и маскировать её fail-open'ом нельзя.
 4. **Ручной guardrail перед записью** — в CF `ydb-tickets` `create-ticket`
    выполняется только для `safe` и `off-topic`; `label == injection` блокирует запись
    (ответ `{"error": "blocked", "reason": "injection_detected"}`) и пишет в лог

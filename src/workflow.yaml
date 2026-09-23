@@ -65,7 +65,7 @@ steps:
         maxDelay: 30s
         retryCount: 3
       output: '\({"text": .Result})'
-      next: mark_escalated
+      next: send_digest
 
   # 4. databaseQuery — то же условие, что и в SELECT, чтобы не подхватить лишнее
   mark_escalated:
@@ -97,7 +97,7 @@ steps:
         maxDelay: 30s
         retryCount: 3
       output: '\({"rowsAffected": .})'
-      next: send_digest
+      next: done
 
   # 5. httpCall — POST в CF email-sender; адрес оператора берёт функция сама из OPERATOR_EMAIL
   send_digest:
@@ -121,7 +121,7 @@ steps:
         maxDelay: 30s
         retryCount: 5
       output: '\({})'
-      next: done
+      next: mark_escalated
 
   nothing_to_escalate:
     success: {}
